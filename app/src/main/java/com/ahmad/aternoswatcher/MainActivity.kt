@@ -1,6 +1,8 @@
 package com.ahmad.aternoswatcher
 
 import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -19,6 +21,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
@@ -125,6 +128,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
         content.addView(checkButton, marginTop(20).apply { height = dp(54) })
+
+        val testNotificationButton = Button(this).apply {
+            text = "♬   اختبار الإشعار"
+            textSize = 13f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = rounded(Color.rgb(43, 57, 78), 15)
+            setOnClickListener { sendTestNotification() }
+        }
+        content.addView(testNotificationButton, marginTop(9).apply { height = dp(48) })
 
         val info = column().apply {
             background = rounded(Color.rgb(25, 37, 58), 18)
@@ -235,6 +248,40 @@ class MainActivity : AppCompatActivity() {
         if (globalError.isNotBlank() && !checking) {
             checkedAt.text = checkedAt.text.toString() + "  •  $globalError"
         }
+    }
+
+    private fun sendTestNotification() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, "اسمح للتطبيق بالإشعارات من إعدادات أندرويد أولاً", Toast.LENGTH_LONG).show()
+            requestNotificationPermission()
+            return
+        }
+        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val channelId = "server_online_v2"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "تنبيهات تشغيل السيرفرات",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "تنبيهات حالة سيرفرات Minecraft"
+                enableVibration(true)
+                setSound(android.provider.Settings.System.DEFAULT_NOTIFICATION_URI, null)
+            }
+            manager.createNotificationChannel(channel)
+        }
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.drawable.ic_stat_notification)
+            .setContentTitle("Aternos Watcher")
+            .setContentText("الإشعارات تعمل بشكل صحيح على هذا الجهاز.")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(999, notification)
+        Toast.makeText(this, "تم إرسال إشعار تجريبي", Toast.LENGTH_SHORT).show()
     }
 
     private fun scheduleMonitoring() {
