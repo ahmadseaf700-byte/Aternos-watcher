@@ -17,7 +17,7 @@ class ServerCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val prefs = applicationContext.getSharedPreferences(ServerConfig.PREFS, Context.MODE_PRIVATE)
         try {
-            ServerConfig.servers.forEachIndexed { index, server ->
+            for ((index, server) in ServerConfig.servers.withIndex()) {
                 val online = checkOnline(server.address) ?: return@withContext Result.retry()
                 val key = "online_$index"
                 val hadPrevious = prefs.contains(key)
