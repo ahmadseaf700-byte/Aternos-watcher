@@ -54,9 +54,9 @@ class ServerCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
 
                 if (result.online != null) {
                     val key = "online_$index"
-                    val hadPrevious = prefs.contains(key)
-                    val wasOnline = prefs.getBoolean(key, false)
-                    if (hadPrevious && !wasOnline && result.online) {
+                    val previousState = prefs.getString("state_$index", null)
+                    // A confirmed ONLINE response after UNKNOWN or OFFLINE is worth notifying.
+                    if (result.online && previousState != "ONLINE") {
                         notifyOnline(index, server.name, server.address, result.playersOnline, result.playersMax)
                     }
                     edit.putBoolean(key, result.online)
@@ -89,8 +89,8 @@ class ServerCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
 
         val socket = Socket()
         return try {
-            socket.connect(InetSocketAddress(host, port), 6500)
-            socket.soTimeout = 6500
+            socket.connect(InetSocketAddress(host, port), 15000)
+            socket.soTimeout = 15000
             val output = DataOutputStream(socket.getOutputStream())
             val input = DataInputStream(socket.getInputStream())
 
