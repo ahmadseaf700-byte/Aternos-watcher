@@ -7,6 +7,9 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -19,85 +22,131 @@ import java.net.ConnectException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+
+private data class ProbeResult(
+    val state: String,
+    val online: Boolean?,
+    val playersOnline: Int? = null,
+    val playersMax: Int? = null,
+    val version: String? = null,
+    val error: String? = null
+)
 
 class ServerCheckWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val prefs = applicationContext.getSharedPreferences(ServerConfig.PREFS, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("is_checking", true).apply()
+        var hasUnknown = false
         try {
             for ((index, server) in ServerConfig.servers.withIndex()) {
-                val online = checkMinecraftStatus(server.address) ?: return@withContext Result.retry()
-                val key = "online_$index"
-                val hadPrevious = prefs.contains(key)
-                val wasOnline = prefs.getBoolean(key, false)
-                if (hadPrevious && !wasOnline && online) notifyOnline(index, server.name, server.address)
-                prefs.edit().putBoolean(key, online).apply()
+                val result = checkMinecraftStatus(server.address)
+                val now = System.currentTimeMillis()
+                val edit = prefs.edit()
+                    .putString("state_$index", result.state)
+                    .putLong("checked_at_$index", now)
+                    .putString("error_$index", result.error.orEmpty())
+
+                result.playersOnline?.let { edit.putInt("players_online_$index", it) }
+                result.playersMax?.let { edit.putInt("players_max_$index", it) }
+                result.version?.let { edit.putString("version_$index", it) }
+                if (result.state == "UNKNOWN") hasUnknown = true
+
+                if (result.online != null) {
+                    val key = "online_$index"
+                    val hadPrevious = prefs.contains(key)
+                    val wasOnline = prefs.getBoolean(key, false)
+                    if (hadPrevious && !wasOnline && result.online) {
+                        notifyOnline(index, server.name, server.address, result.playersOnline, result.playersMax)
+                    }
+                    edit.putBoolean(key, result.online)
+                }
+                edit.apply()
             }
             prefs.edit()
                 .putLong("last_checked", System.currentTimeMillis())
-                .putString("last_check_error", "")
+                .putString("last_check_error", if (hasUnknown) "بعض النتائج غير مؤكدة؛ تحقق من تفاصيل كل سيرفر" else "")
                 .apply()
             Result.success()
         } catch (_: Exception) {
-            prefs.edit().putString("last_check_error", "تعذّر إكمال الفحص").apply()
+            prefs.edit().putString("last_check_error", "حدث خطأ أثناء تنفيذ الفحص").apply()
             Result.retry()
+        } finally {
+            prefs.edit().putBoolean("is_checking", false).apply()
         }
     }
 
     /**
-     * Uses Minecraft's own Server List Ping protocol.
-     * This performs a status handshake only: it does NOT log in as a player.
-     * Returns null for an inconclusive/network failure so we never report it as OFFLINE.
+     * Minecraft Server List Ping (status handshake only).
+     * It does not authenticate, join as a player, or keep a server awake.
      */
-    private fun checkMinecraftStatus(address: String): Boolean? {
+    private fun checkMinecraftStatus(address: String): ProbeResult {
         val parts = address.split(":", limit = 2)
-        if (parts.size != 2) return null
+        if (parts.size != 2) return ProbeResult("UNKNOWN", null, error = "عنوان السيرفر غير صالح")
         val host = parts[0]
-        val port = parts[1].toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+        val port = parts[1].toIntOrNull()?.takeIf { it in 1..65535 }
+            ?: return ProbeResult("UNKNOWN", null, error = "المنفذ غير صالح")
 
         val socket = Socket()
         return try {
-            socket.connect(InetSocketAddress(host, port), 7000)
-            socket.soTimeout = 7000
-
+            socket.connect(InetSocketAddress(host, port), 6500)
+            socket.soTimeout = 6500
             val output = DataOutputStream(socket.getOutputStream())
             val input = DataInputStream(socket.getInputStream())
 
             val handshake = ByteArrayOutputStream()
             val handshakeOut = DataOutputStream(handshake)
-            writeVarInt(handshakeOut, 0)       // Handshake packet ID
-            writeVarInt(handshakeOut, -1)      // Protocol version: status ping accepts any
+            writeVarInt(handshakeOut, 0)
+            writeVarInt(handshakeOut, -1)
             writeString(handshakeOut, host)
             handshakeOut.writeShort(port)
-            writeVarInt(handshakeOut, 1)       // Next state: status
+            writeVarInt(handshakeOut, 1)
             writePacket(output, handshake.toByteArray())
 
-            val statusRequest = ByteArrayOutputStream()
-            val statusOut = DataOutputStream(statusRequest)
-            writeVarInt(statusOut, 0)          // Status Request packet ID
-            writePacket(output, statusRequest.toByteArray())
+            val request = ByteArrayOutputStream()
+            writeVarInt(DataOutputStream(request), 0)
+            writePacket(output, request.toByteArray())
 
             val packetLength = readVarInt(input)
-            if (packetLength <= 0 || packetLength > 1_048_576) return null
-            val packetBytes = ByteArray(packetLength)
-            input.readFully(packetBytes)
-            val packetInput = DataInputStream(ByteArrayInputStream(packetBytes))
-            if (readVarInt(packetInput) != 0) return null
+            if (packetLength <= 0 || packetLength > 1_048_576) {
+                return ProbeResult("UNKNOWN", null, error = "استجابة غير مفهومة من السيرفر")
+            }
+            val packet = ByteArray(packetLength)
+            input.readFully(packet)
+            val packetInput = DataInputStream(ByteArrayInputStream(packet))
+            if (readVarInt(packetInput) != 0) {
+                return ProbeResult("UNKNOWN", null, error = "رد بروتوكول غير متوقع")
+            }
             val jsonLength = readVarInt(packetInput)
-            if (jsonLength <= 0 || jsonLength > packetInput.available()) return null
-            val jsonBytes = ByteArray(jsonLength)
-            packetInput.readFully(jsonBytes)
-            val status = JSONObject(String(jsonBytes, Charsets.UTF_8))
+            if (jsonLength <= 0 || jsonLength > packetInput.available()) {
+                return ProbeResult("UNKNOWN", null, error = "بيانات حالة غير مكتملة")
+            }
+            val json = ByteArray(jsonLength)
+            packetInput.readFully(json)
+            val status = JSONObject(String(json, Charsets.UTF_8))
+            if (!status.has("version") || !status.has("players")) {
+                return ProbeResult("UNKNOWN", null, error = "السيرفر لم يُرجع بيانات Minecraft كاملة")
+            }
 
-            // A valid status response means the Minecraft server answered the protocol ping.
-            status.has("version") && status.has("players")
+            val players = status.optJSONObject("players")
+            val version = status.optJSONObject("version")?.optString("name")?.takeIf { it.isNotBlank() }
+            ProbeResult(
+                state = "ONLINE",
+                online = true,
+                playersOnline = players?.takeIf { it.has("online") }?.optInt("online"),
+                playersMax = players?.takeIf { it.has("max") }?.optInt("max"),
+                version = version
+            )
         } catch (_: ConnectException) {
-            false
+            ProbeResult("OFFLINE", false, error = "رفض السيرفر الاتصال على هذا المنفذ")
         } catch (_: SocketTimeoutException) {
-            null
+            ProbeResult("UNKNOWN", null, error = "انتهت مهلة الرد؛ لا يمكن الجزم بالحالة")
+        } catch (_: UnknownHostException) {
+            ProbeResult("UNKNOWN", null, error = "تعذّر العثور على عنوان السيرفر")
         } catch (_: IOException) {
-            null
+            ProbeResult("UNKNOWN", null, error = "تعذّر قراءة رد Minecraft")
         } catch (_: Exception) {
-            null
+            ProbeResult("UNKNOWN", null, error = "رد غير صالح من السيرفر")
         } finally {
             try { socket.close() } catch (_: Exception) { }
         }
@@ -139,22 +188,23 @@ class ServerCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
         throw IOException("VarInt is too big")
     }
 
-    private fun notifyOnline(index: Int, name: String, address: String) {
+    private fun notifyOnline(index: Int, name: String, address: String, players: Int?, maxPlayers: Int?) {
         val manager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channelId = "server_online"
+        val channelId = "server_online_v2"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(channelId, "تنبيهات تشغيل السيرفرات", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "إشعار عند انتقال سيرفر من Offline إلى Online"
+                description = "إشعار عند انتقال سيرفر من OFFLINE إلى ONLINE"
                 enableVibration(true)
                 setSound(android.provider.Settings.System.DEFAULT_NOTIFICATION_URI, null)
             }
             manager.createNotificationChannel(channel)
         }
+        val playerText = if (players != null && maxPlayers != null) " • اللاعبون: $players/$maxPlayers" else ""
         val notification = NotificationCompat.Builder(applicationContext, channelId)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("السيرفر أصبح Online!")
-            .setContentText("$name جاهز للدخول — $address")
-            .setStyle(NotificationCompat.BigTextStyle().bigText("$name أجاب على فحص Minecraft وأصبح متاحاً. افتح Minecraft وانضم إلى السيرفر."))
+            .setSmallIcon(R.drawable.ic_stat_notification)
+            .setContentTitle("السيرفر أصبح متاحاً")
+            .setContentText("$name • ONLINE$playerText")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$name أجاب على فحص Minecraft وأصبح متاحاً. العنوان: $address"))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setAutoCancel(true)
@@ -164,8 +214,12 @@ class ServerCheckWorker(context: Context, params: WorkerParameters) : CoroutineW
 
     companion object {
         fun enqueueOneTime(context: Context) {
-            val request = androidx.work.OneTimeWorkRequestBuilder<ServerCheckWorker>().build()
-            androidx.work.WorkManager.getInstance(context).enqueue(request)
+            context.getSharedPreferences(ServerConfig.PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean("is_checking", true).apply()
+            val request = OneTimeWorkRequestBuilder<ServerCheckWorker>().build()
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                "manual_server_check", ExistingWorkPolicy.REPLACE, request
+            )
         }
     }
 }
